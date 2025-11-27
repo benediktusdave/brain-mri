@@ -1,0 +1,9 @@
+# =========================
+# File: requirements.txt
+# =========================
+streamlit
+opencv-python-headless
+numpy
+scipy
+pillow
+pandas
