@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import os
 import random
 from PIL import Image
+import pandas as pd
+from scipy import ndimage
 
 # ==================== PAGE CONFIG ====================
 st.set_page_config(
@@ -145,14 +147,143 @@ def morphology_cleanup(mask, open_kernel=3, close_kernel=5):
     return cleaned
 
 
+def watershed_segmentation(image, threshold_value=200, min_area=50):
+    """
+    Watershed segmentation untuk deteksi multiple tumors
+    
+    Returns: markers, colored_output, regions_info
+    """
+    # Preprocessing
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(image)
+    denoised = cv2.medianBlur(enhanced, 3)
+    
+    # Thresholding untuk foreground
+    _, thresh = cv2.threshold(denoised, threshold_value, 255, cv2.THRESH_BINARY)
+    
+    # Noise removal dengan opening
+    kernel = np.ones((3,3), np.uint8)
+    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+    
+    # Sure background area (dilasi)
+    sure_bg = cv2.dilate(opening, kernel, iterations=3)
+    
+    # Sure foreground area (distance transform)
+    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+    _, sure_fg = cv2.threshold(dist_transform, 0.3*dist_transform.max(), 255, 0)
+    sure_fg = np.uint8(sure_fg)
+    
+    # Unknown region
+    unknown = cv2.subtract(sure_bg, sure_fg)
+    
+    # Marker labelling
+    _, markers = cv2.connectedComponents(sure_fg)
+    
+    # Add 1 to all labels (background jadi 1 bukan 0)
+    markers = markers + 1
+    
+    # Mark unknown region as 0
+    markers[unknown == 255] = 0
+    
+    # Apply watershed
+    image_color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    markers = cv2.watershed(image_color, markers)
+    
+    # Extract regions info
+    regions_info = []
+    num_regions = markers.max()
+    
+    for region_id in range(2, num_regions + 1):  # Skip 0 (boundary) dan 1 (background)
+        region_mask = (markers == region_id).astype(np.uint8) * 255
+        area_px = np.count_nonzero(region_mask)
+        
+        if area_px >= min_area:
+            # Find contour untuk mendapatkan centroid
+            contours, _ = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                M = cv2.moments(contours[0])
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                else:
+                    cx, cy = 0, 0
+                
+                regions_info.append({
+                    'id': region_id,
+                    'area_px': area_px,
+                    'centroid': (cx, cy),
+                    'mask': region_mask
+                })
+    
+    # Sort by area (largest first)
+    regions_info.sort(key=lambda x: x['area_px'], reverse=True)
+    
+    # Create colored output
+    colored_output = create_colored_watershed(image, markers, regions_info)
+    
+    return markers, colored_output, regions_info, enhanced, denoised
+
+
+def create_colored_watershed(image, markers, regions_info):
+    """
+    Create beautiful colored visualization of watershed regions
+    """
+    # Create RGB output
+    output = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    
+    # Generate distinct colors for each region
+    colors = [
+        (255, 0, 0),      # Red
+        (0, 255, 0),      # Green
+        (0, 0, 255),      # Blue
+        (255, 255, 0),    # Yellow
+        (255, 0, 255),    # Magenta
+        (0, 255, 255),    # Cyan
+        (255, 128, 0),    # Orange
+        (128, 0, 255),    # Purple
+        (0, 255, 128),    # Spring Green
+        (255, 0, 128),    # Rose
+    ]
+    
+    # Apply colors to each region with transparency
+    overlay = output.copy()
+    
+    for idx, region in enumerate(regions_info):
+        color = colors[idx % len(colors)]
+        region_mask = (markers == region['id'])
+        overlay[region_mask] = color
+    
+    # Blend with original
+    output = cv2.addWeighted(output, 0.6, overlay, 0.4, 0)
+    
+    # Draw boundaries in white
+    output[markers == -1] = [255, 255, 255]
+    
+    # Draw labels and centroids
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for idx, region in enumerate(regions_info):
+        cx, cy = region['centroid']
+        # Draw circle at centroid
+        cv2.circle(output, (cx, cy), 5, (255, 255, 255), -1)
+        cv2.circle(output, (cx, cy), 6, (0, 0, 0), 2)
+        # Draw label
+        label = f"#{idx+1}"
+        cv2.putText(output, label, (cx-10, cy-15), font, 0.6, (255, 255, 255), 2)
+        cv2.putText(output, label, (cx-10, cy-15), font, 0.6, (0, 0, 0), 1)
+    
+    return output
+
+
 def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, close_kernel=5, 
-                 apply_segmentation=True, pixel_spacing_x=1.0, pixel_spacing_y=1.0):
+                 apply_segmentation=True, pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+                 method='threshold'):
     """
     Process a single MRI image through the complete pipeline
     
     Parameters:
     - apply_segmentation: If False, only do sharpening (for normal images)
     - pixel_spacing_x, pixel_spacing_y: mm per pixel
+    - method: 'threshold' or 'watershed'
     
     Returns: dict with all intermediate results
     """
@@ -162,27 +293,68 @@ def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, clos
     results['sharpened'] = fft_sharpen(image, hpf_radius=hpf_radius)
     
     if apply_segmentation:
-        # Step 2: Enhanced Segmentation (ONLY for tumor images)
-        results['segmented'], results['enhanced'], results['denoised'] = enhanced_segmentation(
-            results['sharpened'], threshold_value=threshold_value
-        )
-        
-        # Step 3: Morphology cleanup
-        results['final_mask'] = morphology_cleanup(
-            results['segmented'], 
-            open_kernel=open_kernel,
-            close_kernel=close_kernel
-        )
-        
-        # Step 4: Create overlay
-        overlay = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        overlay[results['final_mask'] > 0] = [255, 0, 0]  # Red for detected tumor
-        results['overlay'] = overlay
-        
-        # Calculate statistics in mm²
-        tumor_pixels = np.count_nonzero(results['final_mask'])
-        results['tumor_area_px'] = tumor_pixels
-        results['tumor_area_mm2'] = tumor_pixels * pixel_spacing_x * pixel_spacing_y
+        if method == 'watershed':
+            # Watershed segmentation
+            markers, colored_output, regions_info, enhanced, denoised = watershed_segmentation(
+                results['sharpened'], threshold_value=threshold_value, min_area=50
+            )
+            
+            results['markers'] = markers
+            results['colored_watershed'] = colored_output
+            results['regions_info'] = regions_info
+            results['enhanced'] = enhanced
+            results['denoised'] = denoised
+            
+            # Calculate total area from all regions
+            total_area_px = sum(r['area_px'] for r in regions_info)
+            results['tumor_area_px'] = total_area_px
+            results['tumor_area_mm2'] = total_area_px * pixel_spacing_x * pixel_spacing_y
+            results['num_regions'] = len(regions_info)
+            
+            # Create combined mask for overlay
+            combined_mask = np.zeros_like(image)
+            for region in regions_info:
+                combined_mask = cv2.bitwise_or(combined_mask, region['mask'])
+            results['final_mask'] = combined_mask
+            results['overlay'] = colored_output
+            
+            # Create regions dataframe
+            regions_data = []
+            for idx, region in enumerate(regions_info):
+                area_mm2 = region['area_px'] * pixel_spacing_x * pixel_spacing_y
+                regions_data.append({
+                    'Tumor': f"#{idx+1}",
+                    'Area (mm²)': f"{area_mm2:.2f}",
+                    'Area (px)': region['area_px'],
+                    'Centroid': f"({region['centroid'][0]}, {region['centroid'][1]})"
+                })
+            results['regions_df'] = pd.DataFrame(regions_data) if regions_data else None
+            
+        else:
+            # Simple threshold segmentation
+            results['segmented'], results['enhanced'], results['denoised'] = enhanced_segmentation(
+                results['sharpened'], threshold_value=threshold_value
+            )
+            
+            # Step 3: Morphology cleanup
+            results['final_mask'] = morphology_cleanup(
+                results['segmented'], 
+                open_kernel=open_kernel,
+                close_kernel=close_kernel
+            )
+            
+            # Step 4: Create overlay
+            overlay = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            overlay[results['final_mask'] > 0] = [255, 0, 0]  # Red for detected tumor
+            results['overlay'] = overlay
+            
+            # Calculate statistics in mm²
+            tumor_pixels = np.count_nonzero(results['final_mask'])
+            results['tumor_area_px'] = tumor_pixels
+            results['tumor_area_mm2'] = tumor_pixels * pixel_spacing_x * pixel_spacing_y
+            results['num_regions'] = 1 if tumor_pixels > 0 else 0
+            results['regions_info'] = None
+            results['regions_df'] = None
         
     else:
         # No segmentation for normal images
@@ -193,6 +365,9 @@ def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, clos
         results['overlay'] = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         results['tumor_area_px'] = 0
         results['tumor_area_mm2'] = 0.0
+        results['num_regions'] = 0
+        results['regions_info'] = None
+        results['regions_df'] = None
     
     return results
 
@@ -239,6 +414,12 @@ hpf_radius = st.sidebar.slider("HPF Radius", 5, 50, 20,
                                 help="Radius untuk High-Pass Filter. Lebih besar = lebih gentle")
 
 st.sidebar.subheader("Segmentation (Tumor Only)")
+segmentation_method = st.sidebar.selectbox(
+    "Segmentation Method",
+    ["Simple Threshold", "Watershed (Multi-region)"],
+    help="Pilih metode segmentasi"
+)
+
 threshold_value = st.sidebar.slider("Threshold Value", 100, 255, 200,
                                      help="Threshold untuk deteksi area terang (tumor)")
 
@@ -335,44 +516,65 @@ if mode == "Random Dataset":
                 st.markdown("---")
             
             st.markdown('<div class="section-header">🔴 Results - TUMOR Images (Full Pipeline)</div>', unsafe_allow_html=True)
-            st.info("💡 Tumor images: FFT Sharpening + Segmentasi + Pengukuran area dalam mm²")
+            method_name = "Watershed Multi-region" if segmentation_method == "Watershed (Multi-region)" else "Simple Threshold"
+            st.info(f"💡 Tumor images: FFT Sharpening + {method_name} Segmentation + Pengukuran area dalam mm²")
             
             for i, img_path in enumerate(st.session_state.selected_tumor):
                 st.markdown(f"### Tumor Image #{i+1}: `{os.path.basename(img_path)}`")
                 
                 # Read and process (WITH SEGMENTATION)
                 image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+                seg_method = 'watershed' if segmentation_method == "Watershed (Multi-region)" else 'threshold'
                 results = process_image(image, hpf_radius, threshold_value, open_kernel, close_kernel, 
                                        apply_segmentation=True,
                                        pixel_spacing_x=pixel_spacing_x, 
-                                       pixel_spacing_y=pixel_spacing_y)
+                                       pixel_spacing_y=pixel_spacing_y,
+                                       method=seg_method)
                 
                 # Display full pipeline
-                cols = st.columns(5)
-                with cols[0]:
-                    st.image(image, caption="Original", use_container_width=True, clamp=True)
-                with cols[1]:
-                    st.image(results['sharpened'], caption="FFT Sharpened", use_container_width=True, clamp=True)
-                with cols[2]:
-                    st.image(results['enhanced'], caption="Enhanced (CLAHE)", use_container_width=True, clamp=True)
-                with cols[3]:
-                    st.image(results['final_mask'], caption="Tumor Detection", use_container_width=True, clamp=True)
-                with cols[4]:
-                    st.image(results['overlay'], caption="Overlay", use_container_width=True, clamp=True)
+                if seg_method == 'watershed':
+                    cols = st.columns(4)
+                    with cols[0]:
+                        st.image(image, caption="Original", use_container_width=True, clamp=True)
+                    with cols[1]:
+                        st.image(results['sharpened'], caption="FFT Sharpened", use_container_width=True, clamp=True)
+                    with cols[2]:
+                        st.image(results['enhanced'], caption="Enhanced (CLAHE)", use_container_width=True, clamp=True)
+                    with cols[3]:
+                        st.image(results['colored_watershed'], caption="🌈 Watershed Regions", use_container_width=True, clamp=True)
+                else:
+                    cols = st.columns(5)
+                    with cols[0]:
+                        st.image(image, caption="Original", use_container_width=True, clamp=True)
+                    with cols[1]:
+                        st.image(results['sharpened'], caption="FFT Sharpened", use_container_width=True, clamp=True)
+                    with cols[2]:
+                        st.image(results['enhanced'], caption="Enhanced (CLAHE)", use_container_width=True, clamp=True)
+                    with cols[3]:
+                        st.image(results['final_mask'], caption="Tumor Detection", use_container_width=True, clamp=True)
+                    with cols[4]:
+                        st.image(results['overlay'], caption="Overlay", use_container_width=True, clamp=True)
                 
                 # Metrics with mm²
-                metric_cols = st.columns(3)
+                metric_cols = st.columns(4)
                 with metric_cols[0]:
-                    st.metric("Tumor Area", f"{results['tumor_area_mm2']:.2f} mm²")
+                    st.metric("Total Tumor Area", f"{results['tumor_area_mm2']:.2f} mm²")
                 with metric_cols[1]:
+                    st.metric("Number of Regions", f"{results['num_regions']}")
+                with metric_cols[2]:
                     img_size_mm2 = image.size * pixel_spacing_x * pixel_spacing_y
                     percentage = (results['tumor_area_mm2'] / img_size_mm2) * 100 if img_size_mm2 > 0 else 0
                     st.metric("% of Image", f"{percentage:.2f}%")
-                with metric_cols[2]:
+                with metric_cols[3]:
                     if results['tumor_area_mm2'] > 0:
                         st.error("🔴 Tumor Detected")
                     else:
                         st.info("ℹ️ No tumor detected")
+                
+                # Show regions table for watershed
+                if seg_method == 'watershed' and results['regions_df'] is not None:
+                    st.markdown("#### 📊 Individual Tumor Regions")
+                    st.dataframe(results['regions_df'], use_container_width=True, hide_index=True)
                 
                 st.markdown("---")
 
@@ -396,10 +598,12 @@ else:  # Upload Image mode
         else:
             # Process
             with st.spinner("Processing..."):
+                seg_method = 'watershed' if segmentation_method == "Watershed (Multi-region)" else 'threshold'
                 results = process_image(image, hpf_radius, threshold_value, open_kernel, close_kernel,
                                        apply_segmentation=apply_seg,
                                        pixel_spacing_x=pixel_spacing_x,
-                                       pixel_spacing_y=pixel_spacing_y)
+                                       pixel_spacing_y=pixel_spacing_y,
+                                       method=seg_method)
             
             st.success("✅ Processing complete!")
             
@@ -407,37 +611,55 @@ else:  # Upload Image mode
                 # Full pipeline for tumor
                 st.markdown("### Processing Pipeline")
                 
-                cols = st.columns(5)
-                with cols[0]:
-                    st.image(image, caption="1. Original", use_container_width=True, clamp=True)
-                with cols[1]:
-                    st.image(results['sharpened'], caption="2. FFT Sharpened", use_container_width=True, clamp=True)
-                with cols[2]:
-                    st.image(results['enhanced'], caption="3. Enhanced (CLAHE)", use_container_width=True, clamp=True)
-                with cols[3]:
-                    st.image(results['segmented'], caption="4. Segmented", use_container_width=True, clamp=True)
-                with cols[4]:
-                    st.image(results['final_mask'], caption="5. Final (Morphology)", use_container_width=True, clamp=True)
+                if seg_method == 'watershed':
+                    cols = st.columns(4)
+                    with cols[0]:
+                        st.image(image, caption="1. Original", use_container_width=True, clamp=True)
+                    with cols[1]:
+                        st.image(results['sharpened'], caption="2. FFT Sharpened", use_container_width=True, clamp=True)
+                    with cols[2]:
+                        st.image(results['enhanced'], caption="3. Enhanced", use_container_width=True, clamp=True)
+                    with cols[3]:
+                        st.image(results['colored_watershed'], caption="4. 🌈 Watershed", use_container_width=True, clamp=True)
+                else:
+                    cols = st.columns(5)
+                    with cols[0]:
+                        st.image(image, caption="1. Original", use_container_width=True, clamp=True)
+                    with cols[1]:
+                        st.image(results['sharpened'], caption="2. FFT Sharpened", use_container_width=True, clamp=True)
+                    with cols[2]:
+                        st.image(results['enhanced'], caption="3. Enhanced (CLAHE)", use_container_width=True, clamp=True)
+                    with cols[3]:
+                        st.image(results['segmented'], caption="4. Segmented", use_container_width=True, clamp=True)
+                    with cols[4]:
+                        st.image(results['final_mask'], caption="5. Final (Morphology)", use_container_width=True, clamp=True)
                 
                 st.markdown("### Final Result")
                 col1, col2 = st.columns(2)
                 with col1:
                     st.image(image, caption="Original Image", use_container_width=True, clamp=True)
                 with col2:
-                    st.image(results['overlay'], caption="Tumor Detection Overlay", use_container_width=True, clamp=True)
+                    st.image(results['overlay'], caption="Tumor Detection", use_container_width=True, clamp=True)
                 
                 # Metrics with mm²
                 st.markdown("### Analysis Results")
-                metric_cols = st.columns(3)
+                metric_cols = st.columns(4)
                 with metric_cols[0]:
                     st.metric("Image Size", f"{image.shape[1]} x {image.shape[0]}")
                 with metric_cols[1]:
-                    st.metric("Tumor Area", f"{results['tumor_area_mm2']:.2f} mm²")
+                    st.metric("Total Tumor Area", f"{results['tumor_area_mm2']:.2f} mm²")
                 with metric_cols[2]:
+                    st.metric("Number of Regions", f"{results['num_regions']}")
+                with metric_cols[3]:
                     if results['tumor_area_mm2'] > 0:
                         st.error("🔴 Tumor Detected")
                     else:
                         st.success("✅ No tumor detected")
+                
+                # Show regions table for watershed
+                if seg_method == 'watershed' and results['regions_df'] is not None:
+                    st.markdown("#### 📊 Individual Tumor Regions")
+                    st.dataframe(results['regions_df'], use_container_width=True, hide_index=True)
             else:
                 # Sharpening only for normal
                 st.markdown("### Sharpening Result (No Segmentation)")
@@ -460,21 +682,28 @@ else:  # Upload Image mode
 st.sidebar.markdown("---")
 with st.sidebar.expander("ℹ️ Help & Info"):
     st.markdown("""
-    **Parameter Guide:**
+    **Segmentation Methods:**
     
+    🔹 **Simple Threshold**
+    - Fast, single region detection
+    - Good for simple cases
+    
+    🌊 **Watershed (Recommended!)**
+    - Multi-region detection
+    - Color-coded tumors
+    - Individual area per tumor
+    - More accurate
+    
+    **Parameter Guide:**
     - **HPF Radius**: 15-25 untuk MRI normal
     - **Threshold**: 180-220 untuk tumor
     - **Opening**: 3-5 untuk noise removal
     - **Closing**: 5-9 untuk hole filling
-    - **Pixel Spacing**: Biasanya 0.5-1.0 mm/pixel untuk MRI
+    - **Pixel Spacing**: 0.5-1.0 mm/pixel untuk MRI
     
     **Processing:**
-    - **Normal**: Hanya sharpening, TIDAK ada segmentasi
+    - **Normal**: Hanya sharpening
     - **Tumor**: Full pipeline + area dalam mm²
-    
-    **Expected Results:**
-    - **Normal**: 0 mm² (no tumor)
-    - **Tumor**: > 10-100 mm² (tergantung ukuran)
     """)
 
 st.sidebar.markdown("---")
