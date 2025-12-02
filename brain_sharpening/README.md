@@ -4,9 +4,33 @@ Aplikasi web (Streamlit) untuk deteksi tumor pada gambar MRI otak menggunakan **
 
 ## Pipeline
 
+### Normal Images (No Tumor)
+- **FFT Sharpening Only** - Enhanced visualization
+
+### Tumor Images - Simple Threshold Method
 1. **FFT Sharpening** - Unsharp Masking dengan High-Pass Filter
-2. **Enhanced Segmentation** - CLAHE + Denoising + Thresholding untuk hasil lebih jelas
-3. **Morphology Cleanup** - Opening & Closing untuk menghilangkan noise dan fill holes
+2. **Enhanced Segmentation** - CLAHE + Denoising + Thresholding
+3. **Morphology Cleanup** - Opening & Closing untuk hasil lebih jelas
+
+### Tumor Images - Watershed Method (Multi-region)
+1. **FFT Sharpening** - Unsharp Masking dengan High-Pass Filter
+2. **Top-hat Filtering** - Enhance bright structures (tumor) on dark background
+3. **CLAHE** - Contrast enhancement
+4. **Denoising** - Median blur
+5. **Watershed Segmentation** - Multi-region tumor detection
+6. **Colored Visualization** - Each tumor region with distinct colors
+
+**Research Reference:** [Brain Tumor Detection using Image Processing](https://medium.com/wanabilini/brain-tumor-detection-using-image-processing-a26b1c927d5d) by Mlachahe Said Salimo
+
+## Features
+
+- ✅ **Two Segmentation Methods:**
+  - Simple Threshold: Fast, single-region detection
+  - Watershed: Advanced, multi-region detection with top-hat filtering
+- ✅ **Area Measurement in mm²** (configurable pixel spacing)
+- ✅ **Multi-region Tumor Detection** with colored visualization
+- ✅ **Interactive Parameters** via sidebar controls
+- ✅ **Random Dataset Loading** or manual upload
 
 ## Setup
 

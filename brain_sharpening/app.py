@@ -1,7 +1,13 @@
 """
 Brain MRI Tumor Detection using Classical Image Processing
-Pipeline: FFT Sharpening -> Enhanced Segmentation -> Morphology
+Pipeline: FFT Sharpening -> Skull Stripping -> Hybrid Binarization -> Watershed -> Geometric Filtering
 Streamlit Web Application
+
+Metode Terbukti Bagus:
+- Skull Stripping (hapus tengkorak)
+- Hybrid Binarization: Top-hat (texture) + Brightness threshold
+- Watershed Segmentation
+- Geometric Properties Filtering: Solidity > 0.6 (bentuk padat = tumor, bukan lipatan otak)
 """
 
 import streamlit as st
@@ -147,105 +153,321 @@ def morphology_cleanup(mask, open_kernel=3, close_kernel=5):
     return cleaned
 
 
-def watershed_segmentation(image, threshold_value=200, min_area=50):
+def tophat_filtering(image, kernel_size=15):
     """
-    Watershed segmentation untuk deteksi multiple tumors
+    Apply Top-hat filtering to enhance bright structures (tumors) on dark background
     
-    Returns: markers, colored_output, regions_info
+    Top-hat transform = Original - Opening
+    This highlights small bright regions that are smaller than the structuring element
+    
+    Parameters:
+    - image: grayscale image (uint8)
+    - kernel_size: size of structuring element (odd number)
+    
+    Returns:
+    - top-hat filtered image (uint8)
+    - opened image (for visualization)
     """
-    # Preprocessing
+    # Create structuring element (disk/ellipse shape)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    
+    # Apply morphological opening
+    opened = cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel)
+    
+    # Top-hat transform: Original - Opening
+    # This extracts bright objects smaller than the structuring element
+    tophat = cv2.subtract(image, opened)
+    
+    # Normalize and enhance the result for better visualization
+    # Top-hat results are often very dim, so we need to stretch the contrast
+    if tophat.max() > 0:
+        # Normalize to full range 0-255
+        tophat = cv2.normalize(tophat, None, 0, 255, cv2.NORM_MINMAX)
+    
+    return tophat, opened
+
+
+def anisotropic_diffusion(image, iterations=15, kappa=50, gamma=0.1, option=1):
+    """
+    Anisotropic Diffusion Filter (Perona-Malik)
+    Edge-preserving smoothing - sesuai artikel penelitian
+    
+    Menghilangkan noise TANPA blur edges tumor - lebih baik dari median/gaussian blur
+    
+    Parameters:
+    - iterations: jumlah iterasi diffusion (default: 15)
+    - kappa: gradient threshold untuk detect edges (default: 50)
+    - gamma: diffusion speed (default: 0.1, must be <= 0.25 for stability)
+    - option: 1 untuk favor high-contrast edges, 2 untuk wide regions
+    
+    Reference: Perona & Malik (1990) - "Scale-Space and Edge Detection Using Anisotropic Diffusion"
+    """
+    img = image.astype(np.float32)
+    
+    for _ in range(iterations):
+        # Calculate gradients in 4 directions (North, South, East, West)
+        nabla_N = np.roll(img, 1, axis=0) - img  # North
+        nabla_S = np.roll(img, -1, axis=0) - img  # South
+        nabla_E = np.roll(img, -1, axis=1) - img  # East
+        nabla_W = np.roll(img, 1, axis=1) - img  # West
+        
+        # Conduction coefficients - PRESERVE edges (high gradient = low diffusion)
+        if option == 1:
+            # Exponential function: c(x) = exp(-(||∇I||/K)^2)
+            # Favors high-contrast edges
+            c_N = np.exp(-(nabla_N/kappa)**2)
+            c_S = np.exp(-(nabla_S/kappa)**2)
+            c_E = np.exp(-(nabla_E/kappa)**2)
+            c_W = np.exp(-(nabla_W/kappa)**2)
+        else:
+            # Rational function: c(x) = 1 / (1 + (||∇I||/K)^2)
+            # Favors wide regions over smaller ones
+            c_N = 1.0 / (1.0 + (nabla_N/kappa)**2)
+            c_S = 1.0 / (1.0 + (nabla_S/kappa)**2)
+            c_E = 1.0 / (1.0 + (nabla_E/kappa)**2)
+            c_W = 1.0 / (1.0 + (nabla_W/kappa)**2)
+        
+        # Update image - diffusion equation
+        img += gamma * (c_N * nabla_N + c_S * nabla_S + c_E * nabla_E + c_W * nabla_W)
+    
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def skull_stripping(image):
+    """
+    Skull Stripping / Brain Extraction (Metode Ketat)
+    Menghapus tengkorak dan menyisakan hanya brain tissue
+    
+    Returns: brain-only image (skull removed), brain_mask
+    """
+    # Step 1: Median blur untuk noise reduction
+    smooth = cv2.medianBlur(image, 5)
+    
+    # Step 2: Otsu threshold untuk separate brain dari background hitam
+    _, thresh = cv2.threshold(smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Step 3: Find largest contour (brain)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    brain_mask = np.zeros_like(image)
+    if contours:
+        # Largest contour = brain
+        largest_contour = max(contours, key=cv2.contourArea)
+        cv2.drawContours(brain_mask, [largest_contour], -1, 255, -1)
+    
+    # Step 4: Erosi pinggiran agar tulang tengkorak tidak ikut
+    kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    brain_mask = cv2.erode(brain_mask, kernel_erode, iterations=2)
+    
+    # Step 5: Apply mask ke smoothed image
+    skull_stripped = cv2.bitwise_and(smooth, smooth, mask=brain_mask)
+    
+    return skull_stripped, brain_mask
+
+
+def calculate_geometric_properties(contour):
+    """
+    Menghitung properti geometri untuk membedakan Tumor vs Noise (Lipatan Otak)
+    
+    Returns:
+    - solidity: Seberapa padat bentuknya? (Tumor > 0.8, Lipatan otak < 0.6)
+    - circularity: Seberapa bulat? (Tumor mendekati 1, Garis lurus mendekati 0)
+    """
+    area = cv2.contourArea(contour)
+    if area == 0:
+        return 0, 0
+    
+    # Solidity: Area / ConvexHull Area
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    solidity = float(area) / hull_area if hull_area > 0 else 0
+    
+    # Circularity: 4π × Area / Perimeter²
+    perimeter = cv2.arcLength(contour, True)
+    circularity = (4 * np.pi * area) / (perimeter * perimeter) if perimeter > 0 else 0
+    
+    return solidity, circularity
+
+
+def watershed_segmentation(image, threshold_value=200, min_area=300, tophat_kernel=50, sensitivity=0.4):
+    """
+    Refined Watershed Segmentation dengan Geometric Properties Filtering
+    
+    Pipeline (Based on proven best method):
+    0. Skull Stripping - hapus tengkorak
+    1. Hybrid Binarization - Top-hat (texture) + Brightness threshold
+    2. Watershed segmentation  
+    3. Intelligent Region Filtering - gunakan Solidity & Circularity untuk filter tumor vs noise
+    4. Post-processing morphology
+    
+    Parameters:
+    - threshold_value: brightness threshold (default: 180)
+    - min_area: minimum area in pixels (default: 300)
+    - tophat_kernel: kernel size for top-hat (default: 50, besar agar tumor besar tidak bolong)
+    - sensitivity: watershed threshold 0.1-0.9 (default: 0.4)
+    
+    Returns: markers, colored_output, regions_info, tophat_filtered, enhanced, binary_combined, brain_extracted
+    """
+    # Step 0: SKULL STRIPPING (Metode Ketat)
+    brain_extracted, brain_mask = skull_stripping(image)
+    
+    # Step 1: HYBRID BINARIZATION
+    
+    # A. Jalur Top-Hat (Untuk Tekstur Tumor)
+    # Kernel besar (50) agar tumor besar tidak bolong tengahnya
+    kernel_tophat = cv2.getStructuringElement(cv2.MORPH_RECT, (tophat_kernel, tophat_kernel))
+    tophat = cv2.morphologyEx(brain_extracted, cv2.MORPH_TOPHAT, kernel_tophat)
+    tophat_norm = cv2.normalize(tophat, None, 0, 255, cv2.NORM_MINMAX)
+    
+    # CLAHE untuk enhance
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(image)
-    denoised = cv2.medianBlur(enhanced, 3)
+    enhanced = clahe.apply(tophat_norm)
     
-    # Thresholding untuk foreground
-    _, thresh = cv2.threshold(denoised, threshold_value, 255, cv2.THRESH_BINARY)
+    # Otsu threshold
+    _, binary_tophat = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    # Noise removal dengan opening
-    kernel = np.ones((3,3), np.uint8)
-    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+    # B. Jalur Brightness (Untuk Tumor Sangat Terang)
+    # Threshold 180 agar tumor yang agak gelap/pudar tetap kena
+    _, binary_bright = cv2.threshold(brain_extracted, threshold_value, 255, cv2.THRESH_BINARY)
     
-    # Sure background area (dilasi)
-    sure_bg = cv2.dilate(opening, kernel, iterations=3)
+    # Gabungkan (OR)
+    binary_combined = cv2.bitwise_or(binary_tophat, binary_bright)
     
-    # Sure foreground area (distance transform)
-    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-    _, sure_fg = cv2.threshold(dist_transform, 0.3*dist_transform.max(), 255, 0)
+    # Apply brain mask
+    binary_combined = cv2.bitwise_and(binary_combined, binary_combined, mask=brain_mask)
+    
+    # Bersihkan noise awal
+    kernel_clean = np.ones((3,3), np.uint8)
+    binary_clean = cv2.morphologyEx(binary_combined, cv2.MORPH_OPEN, kernel_clean, iterations=2)
+    
+    # Step 2: WATERSHED SEGMENTATION
+    sure_bg = cv2.dilate(binary_clean, kernel_clean, iterations=3)
+    dist_transform = cv2.distanceTransform(binary_clean, cv2.DIST_L2, 5)
+    
+    # Threshold distance transform (sensitivity) agar benih tumor terambil
+    _, sure_fg = cv2.threshold(dist_transform, sensitivity * dist_transform.max(), 255, 0)
     sure_fg = np.uint8(sure_fg)
     
-    # Unknown region
     unknown = cv2.subtract(sure_bg, sure_fg)
     
-    # Marker labelling
-    _, markers = cv2.connectedComponents(sure_fg)
-    
-    # Add 1 to all labels (background jadi 1 bukan 0)
-    markers = markers + 1
-    
-    # Mark unknown region as 0
-    markers[unknown == 255] = 0
+    _, markers_initial = cv2.connectedComponents(sure_fg)
+    markers_initial = markers_initial + 1
+    markers_initial[unknown == 255] = 0
     
     # Apply watershed
     image_color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    markers = cv2.watershed(image_color, markers)
+    markers_result = cv2.watershed(image_color, markers_initial)
     
-    # Extract regions info
-    regions_info = []
-    num_regions = markers.max()
+    # Step 3: INTELLIGENT REGION FILTERING (GEOMETRIC PROPERTIES)
+    # Filter berdasarkan bentuk (Solidity & Circularity), bukan cuma luas/terang
     
-    for region_id in range(2, num_regions + 1):  # Skip 0 (boundary) dan 1 (background)
-        region_mask = (markers == region_id).astype(np.uint8) * 255
-        area_px = np.count_nonzero(region_mask)
+    final_mask = np.zeros_like(brain_extracted)
+    unique_markers = np.unique(markers_result)
+    valid_regions = []
+    
+    for marker in unique_markers:
+        if marker <= 1:  # Skip background
+            continue
         
-        if area_px >= min_area:
-            # Find contour untuk mendapatkan centroid
-            contours, _ = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                M = cv2.moments(contours[0])
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                else:
-                    cx, cy = 0, 0
-                
-                regions_info.append({
-                    'id': region_id,
-                    'area_px': area_px,
-                    'centroid': (cx, cy),
-                    'mask': region_mask
-                })
+        # Create temp mask untuk region ini
+        temp_mask = np.zeros_like(brain_extracted)
+        temp_mask[markers_result == marker] = 255
+        
+        # Find contour
+        contours_reg, _ = cv2.findContours(temp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours_reg:
+            continue
+        
+        cnt = contours_reg[0]
+        
+        # Hitung properti
+        area = cv2.contourArea(cnt)
+        mean_val = cv2.mean(brain_extracted, mask=temp_mask)[0]
+        solidity, circularity = calculate_geometric_properties(cnt)
+        
+        # --- LOGIKA FILTERING ---
+        # Syarat Tumor:
+        # 1. Area > min_area (Bukan noise kecil)
+        # 2. Mean > 60 (Cukup terang, bukan background hitam)
+        # 3. Solidity > 0.6 (Bentuknya padat/gumpalan, bukan garis/lipatan otak yang berongga)
+        is_tumor = False
+        
+        if area > min_area and mean_val > 60:
+            if solidity > 0.6:  # Tumor biasanya sangat solid (>0.8), set 0.6 biar aman
+                is_tumor = True
+        
+        if is_tumor:
+            final_mask = cv2.bitwise_or(final_mask, temp_mask)
+            
+            # Calculate centroid
+            M = cv2.moments(cnt)
+            if M['m00'] != 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+            else:
+                cx, cy = 0, 0
+            
+            valid_regions.append({
+                'id': marker,
+                'area_px': int(area),
+                'centroid': (cx, cy),
+                'mask': temp_mask,
+                'mean_intensity': mean_val,
+                'solidity': solidity,
+                'circularity': circularity
+            })
+    
+    # Step 4: POST-PROCESSING MORPHOLOGY (Sesuai Artikel)
+    # Finishing untuk memuluskan tepi dan menambal lubang
+    kernel_finish = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    
+    # A. Closing: Tambal lubang di dalam tumor
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel_finish, iterations=2)
+    # B. Opening: Hapus sisa-sisa noise di pinggir tumor
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, kernel_finish, iterations=1)
+    
+    # Update markers dengan final mask
+    _, markers_final = cv2.connectedComponents(final_mask)
+    markers_final = markers_final + 1
+    markers_final[final_mask == 0] = 1
     
     # Sort by area (largest first)
-    regions_info.sort(key=lambda x: x['area_px'], reverse=True)
+    valid_regions.sort(key=lambda x: x['area_px'], reverse=True)
     
     # Create colored output
-    colored_output = create_colored_watershed(image, markers, regions_info)
+    colored_output = create_colored_watershed(image, markers_final, valid_regions)
     
-    return markers, colored_output, regions_info, enhanced, denoised
+    return markers_final, colored_output, valid_regions, tophat_norm, enhanced, binary_combined, brain_extracted
 
 
 def create_colored_watershed(image, markers, regions_info):
     """
-    Create beautiful colored visualization of watershed regions
+    Create beautiful colored visualization of watershed regions with BRIGHT colors
     """
-    # Create RGB output
-    output = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    # Create RGB output with WHITE background untuk kontras maksimal
+    output = np.ones_like(cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)) * 255
     
-    # Generate distinct colors for each region
+    # Copy original image dengan brightness boost
+    gray_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    # Brighten the background image
+    gray_bright = cv2.convertScaleAbs(gray_rgb, alpha=1.3, beta=30)
+    output = gray_bright.copy()
+    
+    # BRIGHT, VIBRANT colors (high saturation, no gray!)
     colors = [
-        (255, 0, 0),      # Red
-        (0, 255, 0),      # Green
-        (0, 0, 255),      # Blue
-        (255, 255, 0),    # Yellow
-        (255, 0, 255),    # Magenta
-        (0, 255, 255),    # Cyan
-        (255, 128, 0),    # Orange
-        (128, 0, 255),    # Purple
-        (0, 255, 128),    # Spring Green
-        (255, 0, 128),    # Rose
+        (255, 50, 50),      # Bright Red
+        (50, 255, 50),      # Bright Green  
+        (50, 150, 255),     # Bright Blue
+        (255, 255, 50),     # Bright Yellow
+        (255, 50, 255),     # Bright Magenta
+        (50, 255, 255),     # Bright Cyan
+        (255, 165, 0),      # Bright Orange
+        (200, 50, 255),     # Bright Purple
+        (50, 255, 150),     # Bright Spring Green
+        (255, 100, 180),    # Bright Pink
     ]
     
-    # Apply colors to each region with transparency
+    # Apply colors to each region with STRONG transparency (lebih terlihat)
     overlay = output.copy()
     
     for idx, region in enumerate(regions_info):
@@ -253,30 +475,41 @@ def create_colored_watershed(image, markers, regions_info):
         region_mask = (markers == region['id'])
         overlay[region_mask] = color
     
-    # Blend with original
-    output = cv2.addWeighted(output, 0.6, overlay, 0.4, 0)
+    # Blend dengan alpha lebih tinggi untuk warna lebih cerah
+    output = cv2.addWeighted(output, 0.3, overlay, 0.7, 0)
     
-    # Draw boundaries in white
-    output[markers == -1] = [255, 255, 255]
+    # Draw boundaries in BRIGHT YELLOW (lebih terlihat dari putih)
+    output[markers == -1] = [0, 255, 255]  # Cyan boundaries
     
-    # Draw labels and centroids
+    # Draw labels and centroids dengan warna KONTRAS
     font = cv2.FONT_HERSHEY_SIMPLEX
     for idx, region in enumerate(regions_info):
         cx, cy = region['centroid']
-        # Draw circle at centroid
-        cv2.circle(output, (cx, cy), 5, (255, 255, 255), -1)
-        cv2.circle(output, (cx, cy), 6, (0, 0, 0), 2)
-        # Draw label
+        color = colors[idx % len(colors)]
+        
+        # Draw LARGER circle at centroid
+        cv2.circle(output, (cx, cy), 8, (255, 255, 255), -1)  # White fill
+        cv2.circle(output, (cx, cy), 9, (0, 0, 0), 3)  # Black border
+        
+        # Draw LARGER label dengan background
         label = f"#{idx+1}"
-        cv2.putText(output, label, (cx-10, cy-15), font, 0.6, (255, 255, 255), 2)
-        cv2.putText(output, label, (cx-10, cy-15), font, 0.6, (0, 0, 0), 1)
+        text_size = cv2.getTextSize(label, font, 0.8, 2)[0]
+        
+        # Background box untuk text (lebih jelas)
+        box_coords = ((cx-text_size[0]//2-5, cy-text_size[1]-25), 
+                      (cx+text_size[0]//2+5, cy-20))
+        cv2.rectangle(output, box_coords[0], box_coords[1], (0, 0, 0), -1)
+        cv2.rectangle(output, box_coords[0], box_coords[1], (255, 255, 255), 2)
+        
+        # Text dengan warna terang
+        cv2.putText(output, label, (cx-text_size[0]//2, cy-23), font, 0.8, (255, 255, 255), 2)
     
     return output
 
 
 def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, close_kernel=5, 
                  apply_segmentation=True, pixel_spacing_x=1.0, pixel_spacing_y=1.0,
-                 method='threshold'):
+                 method='threshold', tophat_kernel=15, watershed_sensitivity=0.6, min_tumor_area=500):
     """
     Process a single MRI image through the complete pipeline
     
@@ -284,6 +517,9 @@ def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, clos
     - apply_segmentation: If False, only do sharpening (for normal images)
     - pixel_spacing_x, pixel_spacing_y: mm per pixel
     - method: 'threshold' or 'watershed'
+    - tophat_kernel: kernel size for top-hat filtering (watershed only)
+    - watershed_sensitivity: sensitivity for watershed distance transform (higher = less regions)
+    - min_tumor_area: minimum area in pixels to be considered as tumor
     
     Returns: dict with all intermediate results
     """
@@ -294,16 +530,19 @@ def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, clos
     
     if apply_segmentation:
         if method == 'watershed':
-            # Watershed segmentation
-            markers, colored_output, regions_info, enhanced, denoised = watershed_segmentation(
-                results['sharpened'], threshold_value=threshold_value, min_area=50
+            # Watershed segmentation with Geometric Properties Filtering
+            markers, colored_output, regions_info, tophat_filtered, enhanced, binary_combined, brain_extracted = watershed_segmentation(
+                results['sharpened'], threshold_value=threshold_value, min_area=min_tumor_area, 
+                tophat_kernel=tophat_kernel, sensitivity=watershed_sensitivity
             )
             
             results['markers'] = markers
             results['colored_watershed'] = colored_output
             results['regions_info'] = regions_info
+            results['tophat_filtered'] = tophat_filtered
             results['enhanced'] = enhanced
-            results['denoised'] = denoised
+            results['binary_combined'] = binary_combined  # Hybrid binary (tophat + brightness)
+            results['brain_extracted'] = brain_extracted  # Skull-stripped result
             
             # Calculate total area from all regions
             total_area_px = sum(r['area_px'] for r in regions_info)
@@ -398,9 +637,11 @@ st.markdown("""
 Aplikasi untuk deteksi tumor pada gambar MRI otak menggunakan **Classical Image Processing** (tanpa AI/ML).
 
 **Pipeline:**
-1. **FFT Sharpening** - Unsharp Masking dengan High-Pass Filter
-2. **Enhanced Segmentation** - CLAHE + Denoising + Thresholding
-3. **Morphology Cleanup** - Opening & Closing untuk hasil lebih jelas
+- **Normal Images:** FFT Sharpening only
+- **Tumor - Simple Threshold:** FFT → CLAHE → Threshold → Morphology
+- **Tumor - Watershed:** FFT → CLAHE → Top-hat → Hist.Eq → Manual Threshold → Aggressive Morphology → Watershed
+
+**Note:** Watershed telah dioptimasi untuk mendeteksi **tumor besar** saja, menghindari over-segmentation.
 """)
 
 # ==================== SIDEBAR ====================
@@ -420,8 +661,22 @@ segmentation_method = st.sidebar.selectbox(
     help="Pilih metode segmentasi"
 )
 
-threshold_value = st.sidebar.slider("Threshold Value", 100, 255, 200,
-                                     help="Threshold untuk deteksi area terang (tumor)")
+threshold_value = st.sidebar.slider("Threshold Value", 100, 255, 180,
+                                     help="Simple Threshold method: threshold biasa. Watershed: brightness threshold (180 = tumor agak gelap tetap terdeteksi)")
+
+# Watershed-specific parameter
+if segmentation_method == "Watershed (Multi-region)":
+    st.sidebar.subheader("🔬 Watershed Parameters (Geometric Filtering)")
+    tophat_kernel = st.sidebar.slider("Top-hat Kernel Size", 15, 80, 50, step=5,
+                                       help="Kernel BESAR (50+) agar tumor besar tidak bolong tengahnya. Hybrid: Top-hat (texture) + Brightness")
+    watershed_sensitivity = st.sidebar.slider("Watershed Sensitivity", 0.2, 0.8, 0.4, step=0.05,
+                                               help="Distance transform threshold. 0.4 = balanced (detect tumor seeds accurately)")
+    min_tumor_area = st.sidebar.number_input("Min Tumor Area (px)", min_value=100, max_value=2000, value=300, step=50,
+                                              help="Min area untuk dianggap tumor (default: 300px). Filter berdasarkan Solidity > 0.6 (bentuk padat).")
+else:
+    tophat_kernel = 50  # Default value for threshold method
+    watershed_sensitivity = 0.4
+    min_tumor_area = 300
 
 st.sidebar.subheader("Morphology Cleanup")
 open_kernel = st.sidebar.slider("Opening Kernel", 1, 15, 3, step=2,
@@ -483,7 +738,10 @@ if mode == "Random Dataset":
                 results = process_image(image, hpf_radius, threshold_value, open_kernel, close_kernel, 
                                        apply_segmentation=False, 
                                        pixel_spacing_x=pixel_spacing_x, 
-                                       pixel_spacing_y=pixel_spacing_y)
+                                       pixel_spacing_y=pixel_spacing_y,
+                                       tophat_kernel=tophat_kernel,
+                                       watershed_sensitivity=watershed_sensitivity,
+                                       min_tumor_area=min_tumor_area)
                 
                 # Display - Only 2 images for normal
                 cols = st.columns([1, 1, 2])
@@ -529,19 +787,26 @@ if mode == "Random Dataset":
                                        apply_segmentation=True,
                                        pixel_spacing_x=pixel_spacing_x, 
                                        pixel_spacing_y=pixel_spacing_y,
-                                       method=seg_method)
+                                       method=seg_method,
+                                       tophat_kernel=tophat_kernel,
+                                       watershed_sensitivity=watershed_sensitivity,
+                                       min_tumor_area=min_tumor_area)
                 
                 # Display full pipeline
                 if seg_method == 'watershed':
-                    cols = st.columns(4)
+                    cols = st.columns(6)
                     with cols[0]:
                         st.image(image, caption="Original", use_container_width=True, clamp=True)
                     with cols[1]:
                         st.image(results['sharpened'], caption="FFT Sharpened", use_container_width=True, clamp=True)
                     with cols[2]:
-                        st.image(results['enhanced'], caption="Enhanced (CLAHE)", use_container_width=True, clamp=True)
+                        st.image(results['brain_extracted'], caption="🧠 Brain Only", use_container_width=True, clamp=True)
                     with cols[3]:
-                        st.image(results['colored_watershed'], caption="🌈 Watershed Regions", use_container_width=True, clamp=True)
+                        st.image(results['tophat_filtered'], caption="🎩 Top-hat Norm", use_container_width=True, clamp=True)
+                    with cols[4]:
+                        st.image(results['binary_combined'], caption="🔲 Hybrid Binary", use_container_width=True, clamp=True)
+                    with cols[5]:
+                        st.image(results['colored_watershed'], caption="🌈 Watershed + Filter", use_container_width=True, clamp=True)
                 else:
                     cols = st.columns(5)
                     with cols[0]:
@@ -603,7 +868,10 @@ else:  # Upload Image mode
                                        apply_segmentation=apply_seg,
                                        pixel_spacing_x=pixel_spacing_x,
                                        pixel_spacing_y=pixel_spacing_y,
-                                       method=seg_method)
+                                       method=seg_method,
+                                       tophat_kernel=tophat_kernel,
+                                       watershed_sensitivity=watershed_sensitivity,
+                                       min_tumor_area=min_tumor_area)
             
             st.success("✅ Processing complete!")
             
@@ -612,15 +880,19 @@ else:  # Upload Image mode
                 st.markdown("### Processing Pipeline")
                 
                 if seg_method == 'watershed':
-                    cols = st.columns(4)
+                    cols = st.columns(6)
                     with cols[0]:
                         st.image(image, caption="1. Original", use_container_width=True, clamp=True)
                     with cols[1]:
                         st.image(results['sharpened'], caption="2. FFT Sharpened", use_container_width=True, clamp=True)
                     with cols[2]:
-                        st.image(results['enhanced'], caption="3. Enhanced", use_container_width=True, clamp=True)
+                        st.image(results['brain_extracted'], caption="3. 🧠 Brain Only", use_container_width=True, clamp=True)
                     with cols[3]:
-                        st.image(results['colored_watershed'], caption="4. 🌈 Watershed", use_container_width=True, clamp=True)
+                        st.image(results['tophat_filtered'], caption="4. 🎩 Top-hat", use_container_width=True, clamp=True)
+                    with cols[4]:
+                        st.image(results['binary_combined'], caption="5. 🔲 Hybrid Binary", use_container_width=True, clamp=True)
+                    with cols[5]:
+                        st.image(results['colored_watershed'], caption="6. 🌈 Filtered", use_container_width=True, clamp=True)
                 else:
                     cols = st.columns(5)
                     with cols[0]:
