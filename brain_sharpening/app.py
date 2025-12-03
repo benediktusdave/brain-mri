@@ -71,6 +71,9 @@ def fft_sharpen(image, hpf_radius=20):
     
     Returns:
     - sharpened image (uint8)
+    - fft_magnitude_original: FFT spectrum sebelum filter
+    - fft_magnitude_filtered: FFT spectrum setelah HPF
+    - hpf_mask: High-Pass Filter mask
     """
     # Convert to float and normalize
     img_float = image.astype(np.float32) / 255.0
@@ -78,6 +81,13 @@ def fft_sharpen(image, hpf_radius=20):
     # Apply FFT
     fft = np.fft.fft2(img_float)
     fft_shifted = np.fft.fftshift(fft)
+    
+    # Calculate magnitude spectrum (for visualization)
+    magnitude_spectrum_original = np.abs(fft_shifted)
+    magnitude_spectrum_original_log = np.log1p(magnitude_spectrum_original)  # Log scale for better visualization
+    
+    # Normalize to 0-255 for display
+    fft_magnitude_original = cv2.normalize(magnitude_spectrum_original_log, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
     # Create High-Pass Filter mask
     rows, cols = img_float.shape
@@ -89,8 +99,16 @@ def fft_sharpen(image, hpf_radius=20):
     distance = np.sqrt((x - ccol)**2 + (y - crow)**2)
     mask[distance <= hpf_radius] = 0  # Block low frequencies
     
+    # Visualize HPF mask
+    hpf_mask_display = (mask * 255).astype(np.uint8)
+    
     # Apply high-pass filter
     fft_filtered = fft_shifted * mask
+    
+    # Calculate magnitude spectrum after filtering
+    magnitude_spectrum_filtered = np.abs(fft_filtered)
+    magnitude_spectrum_filtered_log = np.log1p(magnitude_spectrum_filtered)
+    fft_magnitude_filtered = cv2.normalize(magnitude_spectrum_filtered_log, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
     # Inverse FFT
     fft_ishifted = np.fft.ifftshift(fft_filtered)
@@ -103,7 +121,7 @@ def fft_sharpen(image, hpf_radius=20):
     # Normalize back to 0-255
     img_sharpened = np.clip(img_sharpened * 255, 0, 255).astype(np.uint8)
     
-    return img_sharpened
+    return img_sharpened, fft_magnitude_original, fft_magnitude_filtered, hpf_mask_display
 
 
 def enhanced_segmentation(image, threshold_value=200):
@@ -442,69 +460,72 @@ def watershed_segmentation(image, threshold_value=200, min_area=300, tophat_kern
 
 def create_colored_watershed(image, markers, regions_info):
     """
-    Create beautiful colored visualization of watershed regions with BRIGHT colors
+    Create beautiful colored visualization of watershed regions with VIBRANT contrasting colors
+    Hanya menggunakan warna, tanpa label angka
     """
-    # Create RGB output with WHITE background untuk kontras maksimal
-    output = np.ones_like(cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)) * 255
-    
-    # Copy original image dengan brightness boost
+    # Copy original image as base
     gray_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-    # Brighten the background image
-    gray_bright = cv2.convertScaleAbs(gray_rgb, alpha=1.3, beta=30)
-    output = gray_bright.copy()
+    output = gray_rgb.copy()
     
-    # BRIGHT, VIBRANT colors (high saturation, no gray!)
+    # VIBRANT, HIGH CONTRAST colors (mudah dibedakan dari tumor putih/abu)
     colors = [
-        (255, 50, 50),      # Bright Red
-        (50, 255, 50),      # Bright Green  
-        (50, 150, 255),     # Bright Blue
-        (255, 255, 50),     # Bright Yellow
-        (255, 50, 255),     # Bright Magenta
-        (50, 255, 255),     # Bright Cyan
-        (255, 165, 0),      # Bright Orange
-        (200, 50, 255),     # Bright Purple
-        (50, 255, 150),     # Bright Spring Green
-        (255, 100, 180),    # Bright Pink
+        (0, 255, 0),        # Lime Green
+        (255, 0, 255),      # Magenta
+        (0, 255, 255),      # Cyan
+        (255, 165, 0),      # Orange
+        (255, 0, 0),        # Red
+        (0, 100, 255),      # Blue
+        (255, 255, 0),      # Yellow
+        (128, 0, 255),      # Purple
+        (0, 255, 128),      # Spring Green
+        (255, 20, 147),     # Deep Pink
     ]
     
-    # Apply colors to each region with STRONG transparency (lebih terlihat)
+    # Apply colors to each region dengan semi-transparent overlay
     overlay = output.copy()
     
     for idx, region in enumerate(regions_info):
         color = colors[idx % len(colors)]
         region_mask = (markers == region['id'])
         overlay[region_mask] = color
+        # Simpan warna ke region info untuk tabel
+        region['color'] = color
+        region['color_name'] = get_color_name(color)
     
-    # Blend dengan alpha lebih tinggi untuk warna lebih cerah
-    output = cv2.addWeighted(output, 0.3, overlay, 0.7, 0)
+    # Blend: 50% original, 50% color untuk visibility yang bagus
+    output = cv2.addWeighted(output, 0.5, overlay, 0.5, 0)
     
-    # Draw boundaries in BRIGHT YELLOW (lebih terlihat dari putih)
-    output[markers == -1] = [0, 255, 255]  # Cyan boundaries
+    # Draw boundaries dengan warna gelap agar terlihat
+    boundary_mask = (markers == -1)
+    output[boundary_mask] = [0, 0, 0]  # Black boundaries untuk kontras
     
-    # Draw labels and centroids dengan warna KONTRAS
-    font = cv2.FONT_HERSHEY_SIMPLEX
+    # HANYA draw small circle di centroid dengan warna region (tanpa label angka)
     for idx, region in enumerate(regions_info):
         cx, cy = region['centroid']
         color = colors[idx % len(colors)]
         
-        # Draw LARGER circle at centroid
-        cv2.circle(output, (cx, cy), 8, (255, 255, 255), -1)  # White fill
-        cv2.circle(output, (cx, cy), 9, (0, 0, 0), 3)  # Black border
-        
-        # Draw LARGER label dengan background
-        label = f"#{idx+1}"
-        text_size = cv2.getTextSize(label, font, 0.8, 2)[0]
-        
-        # Background box untuk text (lebih jelas)
-        box_coords = ((cx-text_size[0]//2-5, cy-text_size[1]-25), 
-                      (cx+text_size[0]//2+5, cy-20))
-        cv2.rectangle(output, box_coords[0], box_coords[1], (0, 0, 0), -1)
-        cv2.rectangle(output, box_coords[0], box_coords[1], (255, 255, 255), 2)
-        
-        # Text dengan warna terang
-        cv2.putText(output, label, (cx-text_size[0]//2, cy-23), font, 0.8, (255, 255, 255), 2)
+        # Draw small circle at centroid dengan warna region
+        cv2.circle(output, (cx, cy), 6, (0, 0, 0), -1)  # Black fill
+        cv2.circle(output, (cx, cy), 5, color, -1)  # Color center
     
     return output
+
+
+def get_color_name(color):
+    """Convert BGR color tuple to readable name"""
+    color_map = {
+        (0, 255, 0): 'Lime Green',
+        (255, 0, 255): 'Magenta',
+        (0, 255, 255): 'Cyan',
+        (255, 165, 0): 'Orange',
+        (255, 0, 0): 'Red',
+        (0, 100, 255): 'Blue',
+        (255, 255, 0): 'Yellow',
+        (128, 0, 255): 'Purple',
+        (0, 255, 128): 'Spring Green',
+        (255, 20, 147): 'Deep Pink',
+    }
+    return color_map.get(color, 'Unknown')
 
 
 def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, close_kernel=5, 
@@ -526,7 +547,7 @@ def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, clos
     results = {}
     
     # Step 1: FFT Sharpening (ALWAYS applied)
-    results['sharpened'] = fft_sharpen(image, hpf_radius=hpf_radius)
+    results['sharpened'], results['fft_original'], results['fft_filtered'], results['hpf_mask'] = fft_sharpen(image, hpf_radius=hpf_radius)
     
     if apply_segmentation:
         if method == 'watershed':
@@ -557,17 +578,18 @@ def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, clos
             results['final_mask'] = combined_mask
             results['overlay'] = colored_output
             
-            # Create regions dataframe
+            # Create regions dataframe with color information
             regions_data = []
             for idx, region in enumerate(regions_info):
                 area_mm2 = region['area_px'] * pixel_spacing_x * pixel_spacing_y
                 regions_data.append({
-                    'Tumor': f"#{idx+1}",
+                    'Region Color': region.get('color_name', 'Unknown'),
                     'Area (mm²)': f"{area_mm2:.2f}",
                     'Area (px)': region['area_px'],
                     'Centroid': f"({region['centroid'][0]}, {region['centroid'][1]})"
                 })
             results['regions_df'] = pd.DataFrame(regions_data) if regions_data else None
+            results['regions_colors'] = [region.get('color', (255, 255, 255)) for region in regions_info]
             
         else:
             # Simple threshold segmentation
@@ -582,9 +604,9 @@ def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, clos
                 close_kernel=close_kernel
             )
             
-            # Step 4: Create overlay
+            # Step 4: Create overlay dengan warna kontras tinggi
             overlay = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-            overlay[results['final_mask'] > 0] = [255, 0, 0]  # Red for detected tumor
+            overlay[results['final_mask'] > 0] = [0, 255, 0]  # Lime Green - kontras tinggi dengan tumor putih
             results['overlay'] = overlay
             
             # Calculate statistics in mm²
@@ -609,6 +631,30 @@ def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, clos
         results['regions_df'] = None
     
     return results
+
+
+def quick_tumor_detection(image, threshold_value=180):
+    """
+    Quick tumor detection untuk menentukan apakah gambar mengandung tumor
+    Menggunakan simple brightness analysis
+    
+    Returns: (is_tumor, bright_ratio)
+    - is_tumor: True jika terdeteksi tumor
+    - bright_ratio: persentase pixel terang (> threshold)
+    """
+    # Apply simple threshold
+    _, bright_mask = cv2.threshold(image, threshold_value, 255, cv2.THRESH_BINARY)
+    
+    # Hitung persentase pixel terang
+    total_pixels = image.size
+    bright_pixels = np.count_nonzero(bright_mask)
+    bright_ratio = (bright_pixels / total_pixels) * 100
+    
+    # Kriteria tumor: Ada area terang yang signifikan (> 1%)
+    # Normal MRI biasanya < 0.5% pixel sangat terang
+    is_tumor = bright_ratio > 1.0
+    
+    return is_tumor, bright_ratio
 
 
 def load_random_images(normal_folder, tumor_folder, num_each=2):
@@ -639,9 +685,7 @@ Aplikasi untuk deteksi tumor pada gambar MRI otak menggunakan **Classical Image 
 **Pipeline:**
 - **Normal Images:** FFT Sharpening only
 - **Tumor - Simple Threshold:** FFT → CLAHE → Threshold → Morphology
-- **Tumor - Watershed:** FFT → CLAHE → Top-hat → Hist.Eq → Manual Threshold → Aggressive Morphology → Watershed
-
-**Note:** Watershed telah dioptimasi untuk mendeteksi **tumor besar** saja, menghindari over-segmentation.
+- **Tumor - Watershed:** FFT → CLAHE → Top-hat → Manual Threshold → Aggressive Morphology → Watershed
 """)
 
 # ==================== SIDEBAR ====================
@@ -654,35 +698,20 @@ st.sidebar.subheader("FFT Sharpening")
 hpf_radius = st.sidebar.slider("HPF Radius", 5, 50, 20, 
                                 help="Radius untuk High-Pass Filter. Lebih besar = lebih gentle")
 
-st.sidebar.subheader("Segmentation (Tumor Only)")
-segmentation_method = st.sidebar.selectbox(
-    "Segmentation Method",
-    ["Simple Threshold", "Watershed (Multi-region)"],
-    help="Pilih metode segmentasi"
-)
+st.sidebar.subheader("🔬 Watershed Segmentation (Tumor Only)")
+st.sidebar.info("Metode: Geometric Filtering (Solidity > 0.6)")
 
-threshold_value = st.sidebar.slider("Threshold Value", 100, 255, 180,
-                                     help="Simple Threshold method: threshold biasa. Watershed: brightness threshold (180 = tumor agak gelap tetap terdeteksi)")
+threshold_value = st.sidebar.slider("Brightness Threshold", 100, 255, 180,
+                                     help="Brightness threshold untuk hybrid binarization (180 = tumor agak gelap tetap terdeteksi)")
 
-# Watershed-specific parameter
-if segmentation_method == "Watershed (Multi-region)":
-    st.sidebar.subheader("🔬 Watershed Parameters (Geometric Filtering)")
-    tophat_kernel = st.sidebar.slider("Top-hat Kernel Size", 15, 80, 50, step=5,
-                                       help="Kernel BESAR (50+) agar tumor besar tidak bolong tengahnya. Hybrid: Top-hat (texture) + Brightness")
-    watershed_sensitivity = st.sidebar.slider("Watershed Sensitivity", 0.2, 0.8, 0.4, step=0.05,
-                                               help="Distance transform threshold. 0.4 = balanced (detect tumor seeds accurately)")
-    min_tumor_area = st.sidebar.number_input("Min Tumor Area (px)", min_value=100, max_value=2000, value=300, step=50,
-                                              help="Min area untuk dianggap tumor (default: 300px). Filter berdasarkan Solidity > 0.6 (bentuk padat).")
-else:
-    tophat_kernel = 50  # Default value for threshold method
-    watershed_sensitivity = 0.4
-    min_tumor_area = 300
+tophat_kernel = st.sidebar.slider("Top-hat Kernel Size", 15, 80, 50, step=5,
+                                   help="Kernel BESAR (50+) agar tumor besar tidak bolong tengahnya. Hybrid: Top-hat (texture) + Brightness")
 
-st.sidebar.subheader("Morphology Cleanup")
-open_kernel = st.sidebar.slider("Opening Kernel", 1, 15, 3, step=2,
-                                 help="Kernel untuk menghilangkan noise kecil")
-close_kernel = st.sidebar.slider("Closing Kernel", 1, 15, 5, step=2,
-                                  help="Kernel untuk mengisi hole kecil")
+watershed_sensitivity = st.sidebar.slider("Watershed Sensitivity", 0.2, 0.8, 0.4, step=0.05,
+                                           help="Distance transform threshold. 0.4 = balanced (detect tumor seeds accurately)")
+
+min_tumor_area = st.sidebar.number_input("Min Tumor Area (px)", min_value=100, max_value=2000, value=300, step=50,
+                                          help="Min area untuk dianggap tumor (default: 300px). Filter berdasarkan Solidity > 0.6 (bentuk padat).")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔬 Pixel Spacing (untuk mm²)")
@@ -728,14 +757,14 @@ if mode == "Random Dataset":
         # Display results if loaded
         if 'selected_normal' in st.session_state:
             st.markdown('<div class="section-header">✅ Results - NORMAL Images (Sharpening Only)</div>', unsafe_allow_html=True)
-            st.info("💡 Normal images: Hanya FFT Sharpening, TIDAK ada segmentasi (tidak perlu deteksi tumor)")
+            st.info("💡 Normal images: FFT Sharpening dengan visualisasi Frequency Spectrum (FFT + HPF)")
             
             for i, img_path in enumerate(st.session_state.selected_normal):
                 st.markdown(f"### Normal Image #{i+1}: `{os.path.basename(img_path)}`")
                 
                 # Read and process (NO SEGMENTATION)
                 image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-                results = process_image(image, hpf_radius, threshold_value, open_kernel, close_kernel, 
+                results = process_image(image, hpf_radius, threshold_value, 3, 5, 
                                        apply_segmentation=False, 
                                        pixel_spacing_x=pixel_spacing_x, 
                                        pixel_spacing_y=pixel_spacing_y,
@@ -743,82 +772,81 @@ if mode == "Random Dataset":
                                        watershed_sensitivity=watershed_sensitivity,
                                        min_tumor_area=min_tumor_area)
                 
-                # Display - Only 2 images for normal
-                cols = st.columns([1, 1, 2])
+                # Display - FFT Spectrum visualization
+                st.markdown("#### 🔬 FFT Frequency Domain Analysis")
+                cols = st.columns(5)
                 with cols[0]:
-                    st.image(image, caption="Original", use_container_width=True, clamp=True)
+                    st.image(image, caption="1. Original Image", use_container_width=True, clamp=True)
                 with cols[1]:
-                    st.image(results['sharpened'], caption="FFT Sharpened (Enhanced)", use_container_width=True, clamp=True)
+                    st.image(results['fft_original'], caption="2. FFT Spectrum\n(Before HPF)", use_container_width=True, clamp=True, channels="GRAY")
                 with cols[2]:
-                    # Show comparison
-                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4))
+                    st.image(results['hpf_mask'], caption="3. HPF Mask\n(Block Center)", use_container_width=True, clamp=True, channels="GRAY")
+                with cols[3]:
+                    st.image(results['fft_filtered'], caption="4. FFT Spectrum\n(After HPF)", use_container_width=True, clamp=True, channels="GRAY")
+                with cols[4]:
+                    st.image(results['sharpened'], caption="5. Sharpened Result", use_container_width=True, clamp=True)
+                
+                # Show Before/After comparison
+                st.markdown("#### 📊 Before vs After Comparison")
+                cols2 = st.columns(2)
+                with cols2[0]:
+                    fig1, ax1 = plt.subplots(figsize=(6, 6))
                     ax1.imshow(image, cmap='gray')
-                    ax1.set_title('Before')
+                    ax1.set_title('Before Sharpening', fontsize=14, fontweight='bold')
                     ax1.axis('off')
+                    st.pyplot(fig1)
+                with cols2[1]:
+                    fig2, ax2 = plt.subplots(figsize=(6, 6))
                     ax2.imshow(results['sharpened'], cmap='gray')
-                    ax2.set_title('After Sharpening')
+                    ax2.set_title('After Sharpening (FFT + HPF)', fontsize=14, fontweight='bold')
                     ax2.axis('off')
-                    plt.tight_layout()
-                    st.pyplot(fig)
+                    st.pyplot(fig2)
                     plt.close()
                 
-                # Metrics
-                metric_cols = st.columns(3)
-                with metric_cols[0]:
-                    st.metric("Status", "Normal")
-                with metric_cols[1]:
-                    st.metric("Tumor Area", "0 mm²")
-                with metric_cols[2]:
-                    st.success("✅ No tumor detected (as expected)")
+                # Explanation
+                st.markdown("""
+                **📖 Penjelasan FFT Sharpening:**
+                1. **FFT Spectrum (Before)**: Frekuensi rendah di tengah (terang), frekuensi tinggi di pinggir
+                2. **HPF Mask**: Lingkaran hitam di tengah = BLOCK frekuensi rendah (background smooth)
+                3. **FFT Spectrum (After)**: Center gelap = frekuensi rendah dibuang, hanya edges/detail tersisa
+                4. **Sharpened Result**: Inverse FFT → edges diperkuat, detail lebih jelas
+                
+                **Rumus**: `Sharpened = Original + High-Frequency Component`
+                """)
                 
                 st.markdown("---")
             
             st.markdown('<div class="section-header">🔴 Results - TUMOR Images (Full Pipeline)</div>', unsafe_allow_html=True)
-            method_name = "Watershed Multi-region" if segmentation_method == "Watershed (Multi-region)" else "Simple Threshold"
-            st.info(f"💡 Tumor images: FFT Sharpening + {method_name} Segmentation + Pengukuran area dalam mm²")
+            st.info("💡 Tumor images: FFT Sharpening + Watershed Segmentation (Geometric Filtering) + Pengukuran area dalam mm²")
             
             for i, img_path in enumerate(st.session_state.selected_tumor):
                 st.markdown(f"### Tumor Image #{i+1}: `{os.path.basename(img_path)}`")
                 
                 # Read and process (WITH SEGMENTATION)
                 image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-                seg_method = 'watershed' if segmentation_method == "Watershed (Multi-region)" else 'threshold'
-                results = process_image(image, hpf_radius, threshold_value, open_kernel, close_kernel, 
+                results = process_image(image, hpf_radius, threshold_value, 3, 5, 
                                        apply_segmentation=True,
                                        pixel_spacing_x=pixel_spacing_x, 
                                        pixel_spacing_y=pixel_spacing_y,
-                                       method=seg_method,
+                                       method='watershed',
                                        tophat_kernel=tophat_kernel,
                                        watershed_sensitivity=watershed_sensitivity,
                                        min_tumor_area=min_tumor_area)
                 
-                # Display full pipeline
-                if seg_method == 'watershed':
-                    cols = st.columns(6)
-                    with cols[0]:
-                        st.image(image, caption="Original", use_container_width=True, clamp=True)
-                    with cols[1]:
-                        st.image(results['sharpened'], caption="FFT Sharpened", use_container_width=True, clamp=True)
-                    with cols[2]:
-                        st.image(results['brain_extracted'], caption="🧠 Brain Only", use_container_width=True, clamp=True)
-                    with cols[3]:
-                        st.image(results['tophat_filtered'], caption="🎩 Top-hat Norm", use_container_width=True, clamp=True)
-                    with cols[4]:
-                        st.image(results['binary_combined'], caption="🔲 Hybrid Binary", use_container_width=True, clamp=True)
-                    with cols[5]:
-                        st.image(results['colored_watershed'], caption="🌈 Watershed + Filter", use_container_width=True, clamp=True)
-                else:
-                    cols = st.columns(5)
-                    with cols[0]:
-                        st.image(image, caption="Original", use_container_width=True, clamp=True)
-                    with cols[1]:
-                        st.image(results['sharpened'], caption="FFT Sharpened", use_container_width=True, clamp=True)
-                    with cols[2]:
-                        st.image(results['enhanced'], caption="Enhanced (CLAHE)", use_container_width=True, clamp=True)
-                    with cols[3]:
-                        st.image(results['final_mask'], caption="Tumor Detection", use_container_width=True, clamp=True)
-                    with cols[4]:
-                        st.image(results['overlay'], caption="Overlay", use_container_width=True, clamp=True)
+                # Display full pipeline (Watershed)
+                cols = st.columns(6)
+                with cols[0]:
+                    st.image(image, caption="Original", use_container_width=True, clamp=True)
+                with cols[1]:
+                    st.image(results['sharpened'], caption="FFT Sharpened", use_container_width=True, clamp=True)
+                with cols[2]:
+                    st.image(results['brain_extracted'], caption="🧠 Brain Only", use_container_width=True, clamp=True)
+                with cols[3]:
+                    st.image(results['tophat_filtered'], caption="🎩 Top-hat Norm", use_container_width=True, clamp=True)
+                with cols[4]:
+                    st.image(results['binary_combined'], caption="🔲 Hybrid Binary", use_container_width=True, clamp=True)
+                with cols[5]:
+                    st.image(results['colored_watershed'], caption="🌈 Watershed + Filter", use_container_width=True, clamp=True)
                 
                 # Metrics with mm²
                 metric_cols = st.columns(4)
@@ -836,10 +864,23 @@ if mode == "Random Dataset":
                     else:
                         st.info("ℹ️ No tumor detected")
                 
-                # Show regions table for watershed
-                if seg_method == 'watershed' and results['regions_df'] is not None:
-                    st.markdown("#### 📊 Individual Tumor Regions")
-                    st.dataframe(results['regions_df'], use_container_width=True, hide_index=True)
+                # Show regions table with color styling
+                if results.get('regions_df') is not None and results.get('regions_colors') is not None:
+                    st.markdown("#### 📊 Individual Tumor Regions (by Color)")
+                    
+                    # Style dataframe dengan warna
+                    def color_rows(row):
+                        colors_list = results.get('regions_colors', [])
+                        idx = row.name
+                        if idx < len(colors_list):
+                            bgr_color = colors_list[idx]
+                            # Convert BGR to RGB hex
+                            rgb_hex = f"#{bgr_color[2]:02x}{bgr_color[1]:02x}{bgr_color[0]:02x}"
+                            return [f'background-color: {rgb_hex}; color: black; font-weight: bold'] * len(row)
+                        return [''] * len(row)
+                    
+                    styled_df = results['regions_df'].style.apply(color_rows, axis=1)
+                    st.dataframe(styled_df, use_container_width=True, hide_index=True)
                 
                 st.markdown("---")
 
@@ -847,11 +888,6 @@ else:  # Upload Image mode
     st.markdown('<div class="section-header">📤 Upload Image Mode</div>', unsafe_allow_html=True)
     
     uploaded_file = st.file_uploader("Upload MRI Image", type=['png', 'jpg', 'jpeg'])
-    
-    # Toggle for image type
-    image_type = st.radio("Image Type", ["Normal (Sharpening only)", "Tumor (Full segmentation)"], 
-                         horizontal=True)
-    apply_seg = (image_type == "Tumor (Full segmentation)")
     
     if uploaded_file is not None:
         # Read image
@@ -861,14 +897,25 @@ else:  # Upload Image mode
         if image is None:
             st.error("❌ Failed to read image")
         else:
+            # AUTO-DETECTION: Quick check apakah ada tumor
+            with st.spinner("🔍 Analyzing image..."):
+                is_tumor, bright_ratio = quick_tumor_detection(image, threshold_value)
+                
+                # Info untuk user
+                if is_tumor:
+                    st.info(f"🔴 **Tumor Detected** (Bright pixels: {bright_ratio:.2f}%) → Running full segmentation...")
+                    apply_seg = True
+                else:
+                    st.info(f"✅ **Normal Image** (Bright pixels: {bright_ratio:.2f}%) → Sharpening only...")
+                    apply_seg = False
+            
             # Process
             with st.spinner("Processing..."):
-                seg_method = 'watershed' if segmentation_method == "Watershed (Multi-region)" else 'threshold'
-                results = process_image(image, hpf_radius, threshold_value, open_kernel, close_kernel,
+                results = process_image(image, hpf_radius, threshold_value, 3, 5,
                                        apply_segmentation=apply_seg,
                                        pixel_spacing_x=pixel_spacing_x,
                                        pixel_spacing_y=pixel_spacing_y,
-                                       method=seg_method,
+                                       method='watershed',
                                        tophat_kernel=tophat_kernel,
                                        watershed_sensitivity=watershed_sensitivity,
                                        min_tumor_area=min_tumor_area)
@@ -876,35 +923,21 @@ else:  # Upload Image mode
             st.success("✅ Processing complete!")
             
             if apply_seg:
-                # Full pipeline for tumor
-                st.markdown("### Processing Pipeline")
-                
-                if seg_method == 'watershed':
-                    cols = st.columns(6)
-                    with cols[0]:
-                        st.image(image, caption="1. Original", use_container_width=True, clamp=True)
-                    with cols[1]:
-                        st.image(results['sharpened'], caption="2. FFT Sharpened", use_container_width=True, clamp=True)
-                    with cols[2]:
-                        st.image(results['brain_extracted'], caption="3. 🧠 Brain Only", use_container_width=True, clamp=True)
-                    with cols[3]:
-                        st.image(results['tophat_filtered'], caption="4. 🎩 Top-hat", use_container_width=True, clamp=True)
-                    with cols[4]:
-                        st.image(results['binary_combined'], caption="5. 🔲 Hybrid Binary", use_container_width=True, clamp=True)
-                    with cols[5]:
-                        st.image(results['colored_watershed'], caption="6. 🌈 Filtered", use_container_width=True, clamp=True)
-                else:
-                    cols = st.columns(5)
-                    with cols[0]:
-                        st.image(image, caption="1. Original", use_container_width=True, clamp=True)
-                    with cols[1]:
-                        st.image(results['sharpened'], caption="2. FFT Sharpened", use_container_width=True, clamp=True)
-                    with cols[2]:
-                        st.image(results['enhanced'], caption="3. Enhanced (CLAHE)", use_container_width=True, clamp=True)
-                    with cols[3]:
-                        st.image(results['segmented'], caption="4. Segmented", use_container_width=True, clamp=True)
-                    with cols[4]:
-                        st.image(results['final_mask'], caption="5. Final (Morphology)", use_container_width=True, clamp=True)
+                # Full pipeline for tumor (Watershed)
+                st.markdown("### 🔴 Tumor Detection Pipeline")
+                cols = st.columns(6)
+                with cols[0]:
+                    st.image(image, caption="1. Original", use_container_width=True, clamp=True)
+                with cols[1]:
+                    st.image(results['sharpened'], caption="2. FFT Sharpened", use_container_width=True, clamp=True)
+                with cols[2]:
+                    st.image(results['brain_extracted'], caption="3. 🧠 Brain Only", use_container_width=True, clamp=True)
+                with cols[3]:
+                    st.image(results['tophat_filtered'], caption="4. 🎩 Top-hat", use_container_width=True, clamp=True)
+                with cols[4]:
+                    st.image(results['binary_combined'], caption="5. 🔲 Hybrid Binary", use_container_width=True, clamp=True)
+                with cols[5]:
+                    st.image(results['colored_watershed'], caption="6. 🌈 Filtered", use_container_width=True, clamp=True)
                 
                 st.markdown("### Final Result")
                 col1, col2 = st.columns(2)
@@ -928,13 +961,26 @@ else:  # Upload Image mode
                     else:
                         st.success("✅ No tumor detected")
                 
-                # Show regions table for watershed
-                if seg_method == 'watershed' and results['regions_df'] is not None:
-                    st.markdown("#### 📊 Individual Tumor Regions")
-                    st.dataframe(results['regions_df'], use_container_width=True, hide_index=True)
+                # Show regions table with color styling
+                if results.get('regions_df') is not None and results.get('regions_colors') is not None:
+                    st.markdown("#### 📊 Individual Tumor Regions (by Color)")
+                    
+                    # Style dataframe dengan warna
+                    def color_rows(row):
+                        colors_list = results.get('regions_colors', [])
+                        idx = row.name
+                        if idx < len(colors_list):
+                            bgr_color = colors_list[idx]
+                            # Convert BGR to RGB hex
+                            rgb_hex = f"#{bgr_color[2]:02x}{bgr_color[1]:02x}{bgr_color[0]:02x}"
+                            return [f'background-color: {rgb_hex}; color: black; font-weight: bold'] * len(row)
+                        return [''] * len(row)
+                    
+                    styled_df = results['regions_df'].style.apply(color_rows, axis=1)
+                    st.dataframe(styled_df, use_container_width=True, hide_index=True)
             else:
                 # Sharpening only for normal
-                st.markdown("### Sharpening Result (No Segmentation)")
+                st.markdown("### ✅ Normal Image - Sharpening Result")
                 col1, col2 = st.columns(2)
                 with col1:
                     st.image(image, caption="Original Image", use_container_width=True, clamp=True)
@@ -948,7 +994,7 @@ else:  # Upload Image mode
                 with metric_cols[1]:
                     st.metric("Tumor Area", "0 mm²")
                 with metric_cols[2]:
-                    st.success("✅ Normal (No segmentation applied)")
+                    st.success("✅ Normal (No tumor detected)")
 
 # ==================== INFO & HELP ====================
 st.sidebar.markdown("---")
