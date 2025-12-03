@@ -61,13 +61,24 @@ st.markdown("""
 
 # ==================== FUNCTIONS ====================
 
-def fft_sharpen(image, hpf_radius=20):
+def fft_sharpen(image, hpf_radius=20, sharpening_strength=1.0):
     """
-    Apply FFT-based sharpening using High-Pass Filter (Unsharp Masking)
+    Apply FFT-based sharpening using Gaussian High-Pass Filter (Unsharp Masking)
+    
+    Gaussian HPF memberikan smooth transition → mengurangi ringing artifacts & noise
+    HPF Radius besar → filter high-freq noise, hasil lebih smooth
+    HPF Radius kecil → preserve detail, hasil lebih sharp (tapi mungkin noisy)
     
     Parameters:
     - image: grayscale input image (uint8)
-    - hpf_radius: radius for high-pass filter
+    - hpf_radius: radius for Gaussian high-pass filter (5-50)
+                  - Small (5-15): Sharp, detail tinggi, mungkin noisy
+                  - Medium (15-30): Balanced, good for most cases
+                  - Large (30-50): Smooth, noise berkurang, less detail
+    - sharpening_strength: multiplier for high-pass details (0.3-2.0)
+                          - Low (0.3-0.7): Subtle sharpening, minimal noise
+                          - Medium (0.8-1.2): Balanced (default: 1.0)
+                          - High (1.3-2.0): Aggressive sharpening, may increase noise
     
     Returns:
     - sharpened image (uint8)
@@ -84,20 +95,22 @@ def fft_sharpen(image, hpf_radius=20):
     
     # Calculate magnitude spectrum (for visualization)
     magnitude_spectrum_original = np.abs(fft_shifted)
-    magnitude_spectrum_original_log = np.log1p(magnitude_spectrum_original)  # Log scale for better visualization
+    magnitude_spectrum_original_log = np.log1p(magnitude_spectrum_original)
     
     # Normalize to 0-255 for display
     fft_magnitude_original = cv2.normalize(magnitude_spectrum_original_log, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
-    # Create High-Pass Filter mask
+    # Create Gaussian High-Pass Filter dengan smooth transition
     rows, cols = img_float.shape
     crow, ccol = rows // 2, cols // 2
     
-    # Create circular mask (low-pass)
-    mask = np.ones((rows, cols), dtype=np.float32)
     y, x = np.ogrid[:rows, :cols]
     distance = np.sqrt((x - ccol)**2 + (y - crow)**2)
-    mask[distance <= hpf_radius] = 0  # Block low frequencies
+    
+    # Gaussian high-pass filter = 1 - Gaussian low-pass
+    # Smooth transition mengurangi ringing artifacts
+    gaussian_lp = np.exp(-(distance**2) / (2 * (hpf_radius**2)))
+    mask = 1 - gaussian_lp
     
     # Visualize HPF mask
     hpf_mask_display = (mask * 255).astype(np.uint8)
@@ -115,8 +128,9 @@ def fft_sharpen(image, hpf_radius=20):
     img_filtered = np.fft.ifft2(fft_ishifted)
     img_filtered = np.real(img_filtered)
     
-    # Unsharp masking: original + high-pass
-    img_sharpened = img_float + img_filtered
+    # Unsharp masking with adjustable strength: original + (strength × high-pass)
+    # Strength control: adjust sharpening intensity without changing frequency cutoff
+    img_sharpened = img_float + (sharpening_strength * img_filtered)
     
     # Normalize back to 0-255
     img_sharpened = np.clip(img_sharpened * 255, 0, 255).astype(np.uint8)
@@ -530,13 +544,15 @@ def get_color_name(color):
 
 def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, close_kernel=5, 
                  apply_segmentation=True, pixel_spacing_x=1.0, pixel_spacing_y=1.0,
-                 method='threshold', tophat_kernel=15, watershed_sensitivity=0.6, min_tumor_area=500):
+                 method='threshold', tophat_kernel=15, watershed_sensitivity=0.6, min_tumor_area=500,
+                 sharpening_strength=1.0):
     """
     Process a single MRI image through the complete pipeline
     
     Parameters:
     - apply_segmentation: If False, only do sharpening (for normal images)
     - pixel_spacing_x, pixel_spacing_y: mm per pixel
+    - sharpening_strength: FFT sharpening intensity multiplier
     - method: 'threshold' or 'watershed'
     - tophat_kernel: kernel size for top-hat filtering (watershed only)
     - watershed_sensitivity: sensitivity for watershed distance transform (higher = less regions)
@@ -546,8 +562,10 @@ def process_image(image, hpf_radius=20, threshold_value=200, open_kernel=3, clos
     """
     results = {}
     
-    # Step 1: FFT Sharpening (ALWAYS applied)
-    results['sharpened'], results['fft_original'], results['fft_filtered'], results['hpf_mask'] = fft_sharpen(image, hpf_radius=hpf_radius)
+    # Step 1: FFT Sharpening (ALWAYS applied) with adjustable strength
+    results['sharpened'], results['fft_original'], results['fft_filtered'], results['hpf_mask'] = fft_sharpen(
+        image, hpf_radius=hpf_radius, sharpening_strength=sharpening_strength
+    )
     
     if apply_segmentation:
         if method == 'watershed':
@@ -696,7 +714,10 @@ mode = st.sidebar.radio("Mode", ["Random Dataset", "Upload Image"])
 st.sidebar.markdown("---")
 st.sidebar.subheader("FFT Sharpening")
 hpf_radius = st.sidebar.slider("HPF Radius", 5, 50, 20, 
-                                help="Radius untuk High-Pass Filter. Lebih besar = lebih gentle")
+                                help="Radius untuk High-Pass Filter. Besar = smooth (filter noise), Kecil = sharp (detail tinggi)")
+
+sharpening_strength = st.sidebar.slider("Sharpening Strength", 0.3, 2.0, 1.0, step=0.1,
+                                        help="Intensitas sharpening. Low (0.3-0.7) = subtle, Medium (0.8-1.2) = balanced, High (1.3-2.0) = aggressive")
 
 st.sidebar.subheader("🔬 Watershed Segmentation (Tumor Only)")
 st.sidebar.info("Metode: Geometric Filtering (Solidity > 0.6)")
@@ -770,7 +791,8 @@ if mode == "Random Dataset":
                                        pixel_spacing_y=pixel_spacing_y,
                                        tophat_kernel=tophat_kernel,
                                        watershed_sensitivity=watershed_sensitivity,
-                                       min_tumor_area=min_tumor_area)
+                                       min_tumor_area=min_tumor_area,
+                                       sharpening_strength=sharpening_strength)
                 
                 # Display - FFT Spectrum visualization
                 st.markdown("#### 🔬 FFT Frequency Domain Analysis")
@@ -831,7 +853,8 @@ if mode == "Random Dataset":
                                        method='watershed',
                                        tophat_kernel=tophat_kernel,
                                        watershed_sensitivity=watershed_sensitivity,
-                                       min_tumor_area=min_tumor_area)
+                                       min_tumor_area=min_tumor_area,
+                                       sharpening_strength=sharpening_strength)
                 
                 # Display full pipeline (Watershed)
                 cols = st.columns(6)
@@ -918,7 +941,8 @@ else:  # Upload Image mode
                                        method='watershed',
                                        tophat_kernel=tophat_kernel,
                                        watershed_sensitivity=watershed_sensitivity,
-                                       min_tumor_area=min_tumor_area)
+                                       min_tumor_area=min_tumor_area,
+                                       sharpening_strength=sharpening_strength)
             
             st.success("✅ Processing complete!")
             
